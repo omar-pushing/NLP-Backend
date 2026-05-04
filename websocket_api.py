@@ -8,12 +8,10 @@ from flask_socketio import SocketIO, emit
 import numpy as np
 import whisper
 import threading
-from collections import deque
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change-this-secret')
 
-# Wildcard CORS - simplest and most reliable
 CORS(app, origins="*")
 
 socketio = SocketIO(
@@ -26,103 +24,220 @@ socketio = SocketIO(
     engineio_logger=False,
 )
 
+SAMPLE_RATE   = 16000
+CHUNK_SECONDS = int(os.getenv('CHUNK_SECONDS', 5))   # transcribe every N seconds of audio
+CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS           # 80 000 samples @ 5 s
+MIN_SAMPLES   = SAMPLE_RATE * 1                       # need at least 1 s before attempting
+
 usedModel = os.getenv('WHISPER_MODEL', 'tiny')
-max_buffer_seconds = int(os.getenv('MAX_BUFFER_SECONDS', 50))
 model = whisper.load_model(usedModel)
+print(f"Whisper model '{usedModel}' loaded.")
 
 
-class RealTimeAudioProcessor:
-    def __init__(self, sample_rate=16000):
-        self.sample_rate = sample_rate
-        self.audio_buffer = deque(maxlen=int(sample_rate * max_buffer_seconds))
+# ── Per-session state ─────────────────────────────────────────────────────────
+
+class SessionProcessor:
+    """One instance per connected socket client."""
+
+    def __init__(self, sid: str):
+        self.sid = sid
+        self.pending: list = []          # raw float32 samples not yet transcribed
         self.lock = threading.Lock()
+        self._busy = False               # True while Whisper is running
+        self._flush_requested = False    # True when stop was pressed mid-transcription
 
-    def add_audio(self, audio_bytes):
+    # ── audio ingestion ───────────────────────────────────────────────────────
+
+    def add_audio(self, payload) -> int:
         try:
-            # Socket.IO may deliver the binary payload as:
-            #   - raw bytes / bytearray  (Uint8Array from the client)
-            #   - a list of ints         (JSON-serialised Uint8Array)
-            if isinstance(audio_bytes, (bytes, bytearray)):
-                raw = audio_bytes
-            elif isinstance(audio_bytes, list):
-                raw = bytes(audio_bytes)
+            if isinstance(payload, (bytes, bytearray)):
+                raw = payload
+            elif isinstance(payload, list):
+                raw = bytes(payload)
             else:
-                # Fallback: try a direct bytes() cast (covers memoryview etc.)
-                raw = bytes(audio_bytes)
-            audio_data = np.frombuffer(raw, dtype=np.float32)
+                raw = bytes(payload)
+            samples = np.frombuffer(raw, dtype=np.float32)
             with self.lock:
-                self.audio_buffer.extend(audio_data)
+                self.pending.extend(samples.tolist())
+                return len(self.pending)
         except Exception as e:
-            print(f"Error adding audio: {e}")
+            print(f"[{self.sid}] add_audio error: {e}")
+            return 0
 
-    def get_buffered_audio(self):
-        with self.lock:
-            if len(self.audio_buffer) > 0:
-                return np.array(list(self.audio_buffer), dtype=np.float32)
-        return None
+    # ── transcription helpers ─────────────────────────────────────────────────
 
-    def transcribe_buffered(self):
+    def _run_whisper(self, audio_np: np.ndarray) -> str:
         try:
-            audio = self.get_buffered_audio()
-            if audio is None or len(audio) < self.sample_rate:
-                return None
-            result = model.transcribe(audio, language="en", fp16=False)
-            return result["text"]
+            result = model.transcribe(audio_np, language="en", fp16=False)
+            return (result.get("text") or "").strip()
         except Exception as e:
-            print(f"Transcription error: {e}")
-            return None
+            print(f"[{self.sid}] Whisper error: {e}")
+            return ""
 
-    def clear_buffer(self):
+    def _make_emit(self, sid):
+        def _emit(event, data):
+            socketio.emit(event, data, to=sid)
+        return _emit
+
+    # ── chunk worker (runs in background thread) ──────────────────────────────
+
+    def _worker(self, emit_fn, is_final: bool = False):
+        """
+        Grab a chunk (or everything on final flush), transcribe, emit.
+        Loops until pending is exhausted if is_final, otherwise does one chunk.
+        """
+        while True:
+            with self.lock:
+                if is_final:
+                    if len(self.pending) < MIN_SAMPLES:
+                        self.pending.clear()
+                        self._busy = False
+                        emit_fn('transcription_result', {'text': '', 'success': True, 'final': True})
+                        return
+                    chunk = list(self.pending)
+                    self.pending.clear()
+                else:
+                    if len(self.pending) < CHUNK_SAMPLES:
+                        self._busy = False
+                        return
+                    chunk = self.pending[:CHUNK_SAMPLES]
+                    self.pending = self.pending[CHUNK_SAMPLES:]
+
+            audio_np = np.array(chunk, dtype=np.float32)
+            text = self._run_whisper(audio_np)
+
+            if text:
+                print(f"[{self.sid}] {'final' if is_final else 'chunk'} → '{text[:80]}'")
+                emit_fn('transcription_result', {
+                    'text': text,
+                    'success': True,
+                    'final': is_final,
+                })
+
+            if is_final:
+                with self.lock:
+                    self._busy = False
+                emit_fn('transcription_result', {'text': '', 'success': True, 'final': True})
+                return
+
+            # For non-final: check if there's another full chunk ready
+            with self.lock:
+                if len(self.pending) >= CHUNK_SAMPLES:
+                    continue   # loop again — process next chunk immediately
+                self._busy = False
+                return
+
+    def maybe_transcribe(self):
+        """Called after every audio_stream event. Kicks off worker if needed."""
         with self.lock:
-            self.audio_buffer.clear()
+            if self._busy or len(self.pending) < CHUNK_SAMPLES:
+                return
+            self._busy = True
+            sid = self.sid
+
+        emit_fn = self._make_emit(sid)
+        t = threading.Thread(target=self._worker, args=(emit_fn, False), daemon=True)
+        t.start()
+
+    def flush(self):
+        """Called when the user stops recording. Transcribes whatever remains."""
+        with self.lock:
+            if self._busy:
+                # Worker is running; mark that a flush is needed — it will be
+                # handled after the current chunk finishes via _flush_after_busy
+                self._flush_requested = True
+                return
+            if len(self.pending) < MIN_SAMPLES:
+                self.pending.clear()
+                socketio.emit('transcription_result', {'text': '', 'success': True, 'final': True}, to=self.sid)
+                return
+            self._busy = True
+            sid = self.sid
+
+        emit_fn = self._make_emit(sid)
+        t = threading.Thread(target=self._worker, args=(emit_fn, True), daemon=True)
+        t.start()
+
+    def clear(self):
+        with self.lock:
+            self.pending.clear()
+            self._flush_requested = False
 
 
-processor = RealTimeAudioProcessor()
+# ── Session registry ──────────────────────────────────────────────────────────
 
+sessions: dict = {}
+sessions_lock = threading.Lock()
+
+
+def get_session(sid: str) -> SessionProcessor:
+    with sessions_lock:
+        if sid not in sessions:
+            sessions[sid] = SessionProcessor(sid)
+        return sessions[sid]
+
+
+def remove_session(sid: str):
+    with sessions_lock:
+        sessions.pop(sid, None)
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'ok', 'model': usedModel}), 200
+    return jsonify({'status': 'ok', 'model': usedModel, 'chunk_seconds': CHUNK_SECONDS}), 200
 
+
+# ── Socket.IO events ──────────────────────────────────────────────────────────
 
 @socketio.on('connect')
 def handle_connect(auth=None):
-    print(f"Client connected: {request.sid}")
+    sid = request.sid
+    get_session(sid)
+    print(f"Client connected: {sid}")
     emit('connection_response', {'data': 'Connected'})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    sid = request.sid
+    remove_session(sid)
+    print(f"Client disconnected: {sid}")
 
 
 @socketio.on('audio_stream')
 def handle_audio_stream(data):
-    try:
-        audio_bytes = data['audio']
-        processor.add_audio(audio_bytes)
-        buf_len = len(processor.audio_buffer)
-        if buf_len % 16000 == 0:  # log every ~1 second of audio
-            print(f"Buffer samples: {buf_len}")
-        emit('buffer_update', {'buffer_size': buf_len})
-    except Exception as e:
-        print(f"Error handling audio: {e}")
+    sid = request.sid
+    session = get_session(sid)
+    buf_len = session.add_audio(data.get('audio', b''))
+    emit('buffer_update', {'buffer_size': buf_len})
+    # Auto-transcribe once we've collected a full chunk
+    session.maybe_transcribe()
+
+
+@socketio.on('stop_recording')
+def handle_stop_recording():
+    """Client fires this the moment the user clicks Stop."""
+    sid = request.sid
+    get_session(sid).flush()
 
 
 @socketio.on('transcribe_request')
 def handle_transcribe_request():
-    try:
-        text = processor.transcribe_buffered()
-        emit('transcription_result', {
-            'text': text if text else 'No audio to transcribe',
-            'success': True
-        })
-    except Exception as e:
-        emit('transcription_result', {'text': f'Error: {str(e)}', 'success': False})
+    """Legacy / manual trigger — same as stop_recording."""
+    sid = request.sid
+    get_session(sid).flush()
 
 
 @socketio.on('clear_buffer')
 def handle_clear_buffer():
-    processor.clear_buffer()
+    sid = request.sid
+    get_session(sid).clear()
     emit('buffer_update', {'buffer_size': 0})
 
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8080))
-    print(f"Starting on port {port}...")
+    print(f"Starting VoiceFlow backend on port {port} …")
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
