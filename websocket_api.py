@@ -84,7 +84,8 @@ class SessionProcessor:
     def _worker(self, emit_fn, is_final: bool = False):
         """
         Grab a chunk (or everything on final flush), transcribe, emit.
-        Loops until pending is exhausted if is_final, otherwise does one chunk.
+        After finishing, checks _flush_requested so a stop that arrived
+        while Whisper was busy is never silently dropped.
         """
         while True:
             with self.lock:
@@ -92,12 +93,18 @@ class SessionProcessor:
                     if len(self.pending) < MIN_SAMPLES:
                         self.pending.clear()
                         self._busy = False
+                        self._flush_requested = False
                         emit_fn('transcription_result', {'text': '', 'success': True, 'final': True})
                         return
                     chunk = list(self.pending)
                     self.pending.clear()
                 else:
                     if len(self.pending) < CHUNK_SAMPLES:
+                        # Before giving up, check if a flush was requested while we were busy
+                        if self._flush_requested:
+                            self._flush_requested = False
+                            is_final = True   # re-enter loop as a final flush
+                            continue
                         self._busy = False
                         return
                     chunk = self.pending[:CHUNK_SAMPLES]
@@ -108,22 +115,27 @@ class SessionProcessor:
 
             if text:
                 print(f"[{self.sid}] {'final' if is_final else 'chunk'} → '{text[:80]}'")
-                emit_fn('transcription_result', {
-                    'text': text,
-                    'success': True,
-                    'final': is_final,
-                })
+
+            emit_fn('transcription_result', {
+                'text': text or '',
+                'success': True,
+                'final': is_final,
+            })
 
             if is_final:
                 with self.lock:
                     self._busy = False
-                emit_fn('transcription_result', {'text': '', 'success': True, 'final': True})
+                    self._flush_requested = False
                 return
 
-            # For non-final: check if there's another full chunk ready
+            # Non-final: loop if another full chunk is ready, otherwise check for pending flush
             with self.lock:
                 if len(self.pending) >= CHUNK_SAMPLES:
-                    continue   # loop again — process next chunk immediately
+                    continue
+                if self._flush_requested:
+                    self._flush_requested = False
+                    is_final = True
+                    continue
                 self._busy = False
                 return
 
