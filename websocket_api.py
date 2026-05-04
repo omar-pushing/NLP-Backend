@@ -1,8 +1,9 @@
-import eventlet
-eventlet.monkey_patch()
+from gevent import monkey
+monkey.patch_all()
 
 import os
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import numpy as np
 import whisper
@@ -14,12 +15,26 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-change-this'
 
 # Allow CORS from env-configured frontend URL or all origins
 allowed_origins = os.getenv('FRONTEND_URL', '*')
-socketio = SocketIO(app, cors_allowed_origins=allowed_origins, async_mode='eventlet')
+
+# Apply CORS to all HTTP routes (needed for socket.io polling)
+CORS(app, origins=allowed_origins, supports_credentials=True)
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=allowed_origins,
+    async_mode='gevent',
+    logger=True,
+    engineio_logger=True,
+    ping_timeout=60,
+    ping_interval=25,
+)
 
 usedModel = os.getenv('WHISPER_MODEL', 'tiny')
-max_buffer_seconds = int(os.getenv('MAX_BUFFER_SECONDS', 50))  # Max buffer length in seconds
+max_buffer_seconds = int(os.getenv('MAX_BUFFER_SECONDS', 50))
+
 # Load model once
-model = whisper.load_model(usedModel) 
+model = whisper.load_model(usedModel)
+
 
 class RealTimeAudioProcessor:
     def __init__(self, sample_rate=16000, chunk_duration=0.5):
@@ -28,42 +43,38 @@ class RealTimeAudioProcessor:
         self.chunk_size = int(sample_rate * chunk_duration)
         self.audio_buffer = deque(maxlen=int(sample_rate * max_buffer_seconds))
         self.lock = threading.Lock()
-    
+
     def add_audio(self, audio_bytes):
-        """Add audio bytes to buffer"""
         try:
             audio_data = np.frombuffer(audio_bytes, dtype=np.float32)
             with self.lock:
                 self.audio_buffer.extend(audio_data)
         except Exception as e:
             print(f"Error adding audio: {e}")
-    
+
     def get_buffered_audio(self):
-        """Get current buffered audio"""
         with self.lock:
             if len(self.audio_buffer) > 0:
                 return np.array(list(self.audio_buffer), dtype=np.float32)
         return None
-    
+
     def transcribe_buffered(self):
-        """Transcribe current buffer"""
         try:
             audio = self.get_buffered_audio()
             if audio is None or len(audio) < self.sample_rate:
                 return None
-            
             result = model.transcribe(audio, language="en", fp16=False)
             return result["text"]
         except Exception as e:
             print(f"Transcription error: {e}")
             return None
-    
+
     def clear_buffer(self):
-        """Clear the audio buffer"""
         with self.lock:
             self.audio_buffer.clear()
 
-# Global processor (per session ideally, but global for simplicity)
+
+# Global processor
 processor = RealTimeAudioProcessor()
 
 
@@ -77,16 +88,16 @@ def handle_connect(auth=None):
     print(f"Client connected: {request.sid}")
     emit('connection_response', {'data': 'Connected to real-time API'})
 
+
 @socketio.on('audio_stream')
 def handle_audio_stream(data):
     try:
         audio_bytes = bytes(data['audio'])
         processor.add_audio(audio_bytes)
-        emit('buffer_update', {
-            'buffer_size': len(processor.audio_buffer)
-        }, broadcast=False)
+        emit('buffer_update', {'buffer_size': len(processor.audio_buffer)}, broadcast=False)
     except Exception as e:
         print(f"Error handling audio: {e}")
+
 
 @socketio.on('transcribe_request')
 def handle_transcribe_request():
@@ -102,10 +113,12 @@ def handle_transcribe_request():
             'success': False
         }, broadcast=False)
 
+
 @socketio.on('clear_buffer')
 def handle_clear_buffer():
     processor.clear_buffer()
     emit('buffer_update', {'buffer_size': 0}, broadcast=False)
+
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
