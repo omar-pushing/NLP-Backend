@@ -1,5 +1,8 @@
+import eventlet
+eventlet.monkey_patch()
+
 import os
-from flask import Flask , request  
+from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 import numpy as np
 import whisper
@@ -7,8 +10,12 @@ import threading
 from collections import deque
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-change-this'
-socketio = SocketIO(app, cors_allowed_origins="*")
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-change-this')
+
+# Allow CORS from env-configured frontend URL or all origins
+allowed_origins = os.getenv('FRONTEND_URL', '*')
+socketio = SocketIO(app, cors_allowed_origins=allowed_origins, async_mode='eventlet')
+
 usedModel = os.getenv('WHISPER_MODEL', 'tiny')
 max_buffer_seconds = int(os.getenv('MAX_BUFFER_SECONDS', 50))  # Max buffer length in seconds
 # Load model once
@@ -56,8 +63,13 @@ class RealTimeAudioProcessor:
         with self.lock:
             self.audio_buffer.clear()
 
-# Global processor
+# Global processor (per session ideally, but global for simplicity)
 processor = RealTimeAudioProcessor()
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'ok', 'model': usedModel}), 200
 
 
 @socketio.on('connect')
@@ -96,5 +108,6 @@ def handle_clear_buffer():
     emit('buffer_update', {'buffer_size': 0}, broadcast=False)
 
 if __name__ == '__main__':
-    print("Starting WebSocket Real-Time Speech-to-Text API...")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    port = int(os.getenv('PORT', 5000))
+    print(f"Starting WebSocket Real-Time Speech-to-Text API on port {port}...")
+    socketio.run(app, host='0.0.0.0', port=port, debug=False)

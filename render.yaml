@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: nlp-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python websocket_api.py
+    envVars:
+      - key: WHISPER_MODEL
+        value: tiny
+      - key: MAX_BUFFER_SECONDS
+        value: "50"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: FRONTEND_URL
+        value: "*"
+      - key: PORT
+        value: "5000"

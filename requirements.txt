@@ -1,4 +1,6 @@
-whisper
+openai-whisper
 numpy
 Flask
 flask-socketio
+eventlet
+gunicorn
