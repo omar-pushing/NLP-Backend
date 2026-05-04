@@ -13,9 +13,8 @@ from collections import deque
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change-this-secret')
 
-allowed_origins = os.getenv('FRONTEND_URL', '*')
-
-CORS(app, origins="*", supports_credentials=True)
+# Wildcard CORS - simplest and most reliable
+CORS(app, origins="*")
 
 socketio = SocketIO(
     app,
@@ -23,8 +22,8 @@ socketio = SocketIO(
     async_mode='gevent',
     ping_timeout=60,
     ping_interval=25,
-    transports=['polling', 'websocket'],
-    allow_upgrades=True,
+    logger=False,
+    engineio_logger=False,
 )
 
 usedModel = os.getenv('WHISPER_MODEL', 'tiny')
@@ -79,7 +78,7 @@ def health_check():
 @socketio.on('connect')
 def handle_connect(auth=None):
     print(f"Client connected: {request.sid}")
-    emit('connection_response', {'data': 'Connected to real-time API'})
+    emit('connection_response', {'data': 'Connected'})
 
 
 @socketio.on('audio_stream')
@@ -87,7 +86,7 @@ def handle_audio_stream(data):
     try:
         audio_bytes = bytes(data['audio'])
         processor.add_audio(audio_bytes)
-        emit('buffer_update', {'buffer_size': len(processor.audio_buffer)}, broadcast=False)
+        emit('buffer_update', {'buffer_size': len(processor.audio_buffer)})
     except Exception as e:
         print(f"Error handling audio: {e}")
 
@@ -99,18 +98,18 @@ def handle_transcribe_request():
         emit('transcription_result', {
             'text': text if text else 'No audio to transcribe',
             'success': True
-        }, broadcast=False)
+        })
     except Exception as e:
-        emit('transcription_result', {'text': f'Error: {str(e)}', 'success': False}, broadcast=False)
+        emit('transcription_result', {'text': f'Error: {str(e)}', 'success': False})
 
 
 @socketio.on('clear_buffer')
 def handle_clear_buffer():
     processor.clear_buffer()
-    emit('buffer_update', {'buffer_size': 0}, broadcast=False)
+    emit('buffer_update', {'buffer_size': 0})
 
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
+    port = int(os.getenv('PORT', 8080))
     print(f"Starting on port {port}...")
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
