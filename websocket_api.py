@@ -39,7 +39,17 @@ class RealTimeAudioProcessor:
 
     def add_audio(self, audio_bytes):
         try:
-            audio_data = np.frombuffer(audio_bytes, dtype=np.float32)
+            # Socket.IO may deliver the binary payload as:
+            #   - raw bytes / bytearray  (Uint8Array from the client)
+            #   - a list of ints         (JSON-serialised Uint8Array)
+            if isinstance(audio_bytes, (bytes, bytearray)):
+                raw = audio_bytes
+            elif isinstance(audio_bytes, list):
+                raw = bytes(audio_bytes)
+            else:
+                # Fallback: try a direct bytes() cast (covers memoryview etc.)
+                raw = bytes(audio_bytes)
+            audio_data = np.frombuffer(raw, dtype=np.float32)
             with self.lock:
                 self.audio_buffer.extend(audio_data)
         except Exception as e:
@@ -84,9 +94,12 @@ def handle_connect(auth=None):
 @socketio.on('audio_stream')
 def handle_audio_stream(data):
     try:
-        audio_bytes = bytes(data['audio'])
+        audio_bytes = data['audio']
         processor.add_audio(audio_bytes)
-        emit('buffer_update', {'buffer_size': len(processor.audio_buffer)})
+        buf_len = len(processor.audio_buffer)
+        if buf_len % 16000 == 0:  # log every ~1 second of audio
+            print(f"Buffer samples: {buf_len}")
+        emit('buffer_update', {'buffer_size': buf_len})
     except Exception as e:
         print(f"Error handling audio: {e}")
 
