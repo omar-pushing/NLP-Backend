@@ -25,30 +25,39 @@ socketio = SocketIO(
 )
 
 SAMPLE_RATE   = 16000
-CHUNK_SECONDS = int(os.getenv('CHUNK_SECONDS', 5))   # transcribe every N seconds of audio
-CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS           # 80 000 samples @ 5 s
-MIN_SAMPLES   = SAMPLE_RATE * 1                       # need at least 1 s before attempting
+CHUNK_SECONDS = int(os.getenv('CHUNK_SECONDS', 5))
+CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS   # 80 000 samples = 5 s
+MIN_SAMPLES   = SAMPLE_RATE * 1               # at least 1 s
 
 usedModel = os.getenv('WHISPER_MODEL', 'tiny')
 model = whisper.load_model(usedModel)
-print(f"Whisper model '{usedModel}' loaded.")
+print(f"Whisper '{usedModel}' loaded.")
 
-
-# ── Per-session state ─────────────────────────────────────────────────────────
 
 class SessionProcessor:
-    """One instance per connected socket client."""
+    def __init__(self, sid):
+        self.sid     = sid
+        self.pending = []            # float32 samples
+        self.lock    = threading.Lock()
+        self._worker_thread = None   # currently running thread, or None
 
-    def __init__(self, sid: str):
-        self.sid = sid
-        self.pending: list = []          # raw float32 samples not yet transcribed
-        self.lock = threading.Lock()
-        self._busy = False               # True while Whisper is running
-        self._flush_requested = False    # True when stop was pressed mid-transcription
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _emit(self, event, data):
+        socketio.emit(event, data, to=self.sid)
+
+    def _run_whisper(self, samples):
+        try:
+            audio = np.array(samples, dtype=np.float32)
+            result = model.transcribe(audio, language="en", fp16=False)
+            return (result.get("text") or "").strip()
+        except Exception as e:
+            print(f"[{self.sid}] Whisper error: {e}")
+            return ""
 
     # ── audio ingestion ───────────────────────────────────────────────────────
 
-    def add_audio(self, payload) -> int:
+    def add_audio(self, payload):
         try:
             if isinstance(payload, (bytes, bytearray)):
                 raw = payload
@@ -64,59 +73,49 @@ class SessionProcessor:
             print(f"[{self.sid}] add_audio error: {e}")
             return 0
 
-    # ── transcription helpers ─────────────────────────────────────────────────
+    # ── worker ────────────────────────────────────────────────────────────────
 
-    def _run_whisper(self, audio_np: np.ndarray) -> str:
-        try:
-            result = model.transcribe(audio_np, language="en", fp16=False)
-            return (result.get("text") or "").strip()
-        except Exception as e:
-            print(f"[{self.sid}] Whisper error: {e}")
-            return ""
-
-    def _make_emit(self, sid):
-        def _emit(event, data):
-            socketio.emit(event, data, to=sid)
-        return _emit
-
-    # ── chunk worker (runs in background thread) ──────────────────────────────
-
-    def _worker(self, emit_fn, is_final: bool = False):
+    def _worker(self):
         """
-        Grab a chunk (or everything on final flush), transcribe, emit.
-        After finishing, checks _flush_requested so a stop that arrived
-        while Whisper was busy is never silently dropped.
+        Runs in a background thread.
+        Drains self.pending in CHUNK_SAMPLES-sized bites.
+        Exits only when pending is empty, then emits final=True.
+        Because it holds no lock while Whisper runs, a concurrent add_audio
+        can safely extend self.pending — we'll pick it up on the next loop.
         """
         while True:
+            # ── grab next chunk ──────────────────────────────────────────────
             with self.lock:
-                if is_final:
-                    if len(self.pending) < MIN_SAMPLES:
+                n = len(self.pending)
+
+                if n == 0:
+                    # Nothing left — we're done
+                    self._worker_thread = None
+                    self._emit('transcription_result', {'text': '', 'success': True, 'final': True})
+                    return
+
+                if n >= CHUNK_SAMPLES:
+                    chunk = self.pending[:CHUNK_SAMPLES]
+                    self.pending = self.pending[CHUNK_SAMPLES:]
+                    is_final = False
+                else:
+                    # Less than a full chunk — this only happens during a flush
+                    # (the worker is started by flush() when n >= MIN_SAMPLES)
+                    if n < MIN_SAMPLES:
                         self.pending.clear()
-                        self._busy = False
-                        self._flush_requested = False
-                        emit_fn('transcription_result', {'text': '', 'success': True, 'final': True})
+                        self._worker_thread = None
+                        self._emit('transcription_result', {'text': '', 'success': True, 'final': True})
                         return
                     chunk = list(self.pending)
                     self.pending.clear()
-                else:
-                    if len(self.pending) < CHUNK_SAMPLES:
-                        # Before giving up, check if a flush was requested while we were busy
-                        if self._flush_requested:
-                            self._flush_requested = False
-                            is_final = True   # re-enter loop as a final flush
-                            continue
-                        self._busy = False
-                        return
-                    chunk = self.pending[:CHUNK_SAMPLES]
-                    self.pending = self.pending[CHUNK_SAMPLES:]
+                    is_final = True
 
-            audio_np = np.array(chunk, dtype=np.float32)
-            text = self._run_whisper(audio_np)
-
+            # ── transcribe (lock NOT held) ───────────────────────────────────
+            text = self._run_whisper(chunk)
             if text:
-                print(f"[{self.sid}] {'final' if is_final else 'chunk'} → '{text[:80]}'")
+                print(f"[{self.sid}] → '{text[:80]}'")
 
-            emit_fn('transcription_result', {
+            self._emit('transcription_result', {
                 'text': text or '',
                 'success': True,
                 'final': is_final,
@@ -124,132 +123,109 @@ class SessionProcessor:
 
             if is_final:
                 with self.lock:
-                    self._busy = False
-                    self._flush_requested = False
+                    self._worker_thread = None
                 return
+            # else loop — check if more samples accumulated while we were busy
 
-            # Non-final: loop if another full chunk is ready, otherwise check for pending flush
-            with self.lock:
-                if len(self.pending) >= CHUNK_SAMPLES:
-                    continue
-                if self._flush_requested:
-                    self._flush_requested = False
-                    is_final = True
-                    continue
-                self._busy = False
-                return
+    # ── public API ────────────────────────────────────────────────────────────
 
     def maybe_transcribe(self):
-        """Called after every audio_stream event. Kicks off worker if needed."""
+        """Start worker if a full chunk is ready and no worker is running."""
         with self.lock:
-            if self._busy or len(self.pending) < CHUNK_SAMPLES:
+            if self._worker_thread is not None:
+                return   # already running — it will loop and pick up more data
+            if len(self.pending) < CHUNK_SAMPLES:
                 return
-            self._busy = True
-            sid = self.sid
-
-        emit_fn = self._make_emit(sid)
-        t = threading.Thread(target=self._worker, args=(emit_fn, False), daemon=True)
+            t = threading.Thread(target=self._worker, daemon=True)
+            self._worker_thread = t
         t.start()
 
     def flush(self):
-        """Called when the user stops recording. Transcribes whatever remains."""
+        """
+        Called on Stop. If a worker is already running it will naturally drain
+        all pending samples and emit final=True when done. If not, start one.
+        """
         with self.lock:
-            if self._busy:
-                # Worker is running; mark that a flush is needed — it will be
-                # handled after the current chunk finishes via _flush_after_busy
-                self._flush_requested = True
+            if self._worker_thread is not None:
+                # Worker is running and will keep looping until pending is empty,
+                # then emit final=True by itself — nothing to do here.
                 return
             if len(self.pending) < MIN_SAMPLES:
+                # Nothing worth transcribing
                 self.pending.clear()
-                socketio.emit('transcription_result', {'text': '', 'success': True, 'final': True}, to=self.sid)
-                return
-            self._busy = True
-            sid = self.sid
+                # Emit final directly (no thread needed)
+                sid = self.sid
+            else:
+                t = threading.Thread(target=self._worker, daemon=True)
+                self._worker_thread = t
+                sid = None
 
-        emit_fn = self._make_emit(sid)
-        t = threading.Thread(target=self._worker, args=(emit_fn, True), daemon=True)
-        t.start()
+        if sid:
+            socketio.emit('transcription_result', {'text': '', 'success': True, 'final': True}, to=sid)
+        else:
+            t.start()
 
     def clear(self):
         with self.lock:
             self.pending.clear()
-            self._flush_requested = False
+            # Don't kill the worker — it will emit final=True on its own when
+            # it finds pending empty, which is fine.
 
 
 # ── Session registry ──────────────────────────────────────────────────────────
 
-sessions: dict = {}
+sessions = {}
 sessions_lock = threading.Lock()
 
-
-def get_session(sid: str) -> SessionProcessor:
+def get_session(sid):
     with sessions_lock:
         if sid not in sessions:
             sessions[sid] = SessionProcessor(sid)
         return sessions[sid]
 
-
-def remove_session(sid: str):
+def remove_session(sid):
     with sessions_lock:
         sessions.pop(sid, None)
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes & events ───────────────────────────────────────────────────────────
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'ok', 'model': usedModel, 'chunk_seconds': CHUNK_SECONDS}), 200
-
-
-# ── Socket.IO events ──────────────────────────────────────────────────────────
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok', 'model': usedModel, 'chunk_seconds': CHUNK_SECONDS})
 
 @socketio.on('connect')
-def handle_connect(auth=None):
-    sid = request.sid
-    get_session(sid)
-    print(f"Client connected: {sid}")
+def on_connect(auth=None):
+    get_session(request.sid)
+    print(f"+ {request.sid}")
     emit('connection_response', {'data': 'Connected'})
 
-
 @socketio.on('disconnect')
-def handle_disconnect():
-    sid = request.sid
-    remove_session(sid)
-    print(f"Client disconnected: {sid}")
-
+def on_disconnect():
+    remove_session(request.sid)
+    print(f"- {request.sid}")
 
 @socketio.on('audio_stream')
-def handle_audio_stream(data):
-    sid = request.sid
-    session = get_session(sid)
-    buf_len = session.add_audio(data.get('audio', b''))
-    emit('buffer_update', {'buffer_size': buf_len})
-    # Auto-transcribe once we've collected a full chunk
-    session.maybe_transcribe()
-
+def on_audio(data):
+    s = get_session(request.sid)
+    n = s.add_audio(data.get('audio', b''))
+    emit('buffer_update', {'buffer_size': n})
+    s.maybe_transcribe()
 
 @socketio.on('stop_recording')
-def handle_stop_recording():
-    """Client fires this the moment the user clicks Stop."""
-    sid = request.sid
-    get_session(sid).flush()
+def on_stop():
+    get_session(request.sid).flush()
 
-
-@socketio.on('transcribe_request')
-def handle_transcribe_request():
-    """Legacy / manual trigger — same as stop_recording."""
-    sid = request.sid
-    get_session(sid).flush()
-
+@socketio.on('transcribe_request')   # legacy
+def on_transcribe():
+    get_session(request.sid).flush()
 
 @socketio.on('clear_buffer')
-def handle_clear_buffer():
-    sid = request.sid
-    get_session(sid).clear()
+def on_clear():
+    get_session(request.sid).clear()
     emit('buffer_update', {'buffer_size': 0})
-
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8080))
-    print(f"Starting VoiceFlow backend on port {port} …")
+    print(f"Starting on :{port}")
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
