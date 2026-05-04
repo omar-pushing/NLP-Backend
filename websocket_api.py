@@ -11,36 +11,30 @@ import threading
 from collections import deque
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-change-this')
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change-this-secret')
 
-# Allow CORS from env-configured frontend URL or all origins
 allowed_origins = os.getenv('FRONTEND_URL', '*')
 
-# Apply CORS to all HTTP routes (needed for socket.io polling)
-CORS(app, origins=allowed_origins, supports_credentials=True)
+CORS(app, origins="*", supports_credentials=True)
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins=allowed_origins,
+    cors_allowed_origins="*",
     async_mode='gevent',
-    logger=True,
-    engineio_logger=True,
     ping_timeout=60,
     ping_interval=25,
+    transports=['polling', 'websocket'],
+    allow_upgrades=True,
 )
 
 usedModel = os.getenv('WHISPER_MODEL', 'tiny')
 max_buffer_seconds = int(os.getenv('MAX_BUFFER_SECONDS', 50))
-
-# Load model once
 model = whisper.load_model(usedModel)
 
 
 class RealTimeAudioProcessor:
-    def __init__(self, sample_rate=16000, chunk_duration=0.5):
+    def __init__(self, sample_rate=16000):
         self.sample_rate = sample_rate
-        self.chunk_duration = chunk_duration
-        self.chunk_size = int(sample_rate * chunk_duration)
         self.audio_buffer = deque(maxlen=int(sample_rate * max_buffer_seconds))
         self.lock = threading.Lock()
 
@@ -74,7 +68,6 @@ class RealTimeAudioProcessor:
             self.audio_buffer.clear()
 
 
-# Global processor
 processor = RealTimeAudioProcessor()
 
 
@@ -108,10 +101,7 @@ def handle_transcribe_request():
             'success': True
         }, broadcast=False)
     except Exception as e:
-        emit('transcription_result', {
-            'text': f'Error: {str(e)}',
-            'success': False
-        }, broadcast=False)
+        emit('transcription_result', {'text': f'Error: {str(e)}', 'success': False}, broadcast=False)
 
 
 @socketio.on('clear_buffer')
@@ -122,5 +112,5 @@ def handle_clear_buffer():
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
-    print(f"Starting WebSocket Real-Time Speech-to-Text API on port {port}...")
+    print(f"Starting on port {port}...")
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
