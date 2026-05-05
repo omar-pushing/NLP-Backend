@@ -1,8 +1,6 @@
 openai-whisper
 numpy
-Flask==3.0.3
-flask-socketio==5.3.6
-flask-cors==4.0.1
-gevent==24.2.1
-gevent-websocket==0.10.1
-gunicorn==22.0.0
+Flask
+flask-socketio
+eventlet
+gunicorn

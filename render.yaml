@@ -3,15 +3,13 @@ services:
     name: nlp-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python websocket_api.py
+    startCommand: gunicorn --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker --workers 1 --bind 0.0.0.0:$PORT websocket_api:app
     envVars:
       - key: WHISPER_MODEL
         value: tiny
-      - key: MAX_BUFFER_SECONDS
-        value: "50"
+      - key: CHUNK_SECONDS
+        value: "5"
       - key: SECRET_KEY
         generateValue: true
-      - key: FRONTEND_URL
-        value: "*"
       - key: PORT
-        value: "5000"
+        value: "10000"
