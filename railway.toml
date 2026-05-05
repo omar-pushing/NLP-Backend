@@ -1,7 +1,8 @@
 [build]
 builder = "nixpacks"
+buildCommand = "apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt"
 
 [deploy]
 startCommand = "sh start.sh"
 restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 3
+restartPolicyMaxRetries = 5
